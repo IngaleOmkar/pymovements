@@ -32,19 +32,28 @@ from typing import Literal
 from typing import overload
 from warnings import warn
 
-import numpy as np
 import polars
+import yaml
 from deprecated.sphinx import deprecated
 from tqdm import tqdm
 
+from pymovements import transforms
 from pymovements._utils._checks import check_is_mutual_exclusive
 from pymovements._utils._html import repr_html
 from pymovements.events import EventDetectionLibrary
 from pymovements.events import Events
-from pymovements.events import events2segmentation
-from pymovements.events import events2timeratio
-from pymovements.gaze import transforms
 from pymovements.gaze.experiment import Experiment
+from pymovements.gaze.quality import DataQualityReport
+from pymovements.gaze.quality import run_report
+from pymovements.gaze.validation import check_gaze_components_defined
+from pymovements.gaze.validation import check_gaze_range
+from pymovements.gaze.validation import check_max_gap
+from pymovements.gaze.validation import check_sampling_rate_consistency
+from pymovements.gaze.validation import check_time_column_exists
+from pymovements.gaze.validation import check_time_monotone
+from pymovements.gaze.validation import check_trial_columns_dtype
+from pymovements.gaze.validation import check_trial_columns_exist
+from pymovements.gaze.validation import CheckResult
 from pymovements.measure.events.processing import EventSamplesProcessor
 from pymovements.measure.samples.library import SampleMeasureLibrary
 from pymovements.stimulus import TextStimulus
@@ -77,6 +86,13 @@ class Gaze:
         the input data frame is assumed to contain only one trial. If the list is not empty,
         the input data frame is assumed to contain multiple trials, and the transformation
         methods will be applied to each trial separately. (default: None)
+    calibrations: polars.DataFrame | None
+        The calibrations from the data: timestamp, num_points, tracked eye, tracking_mode.
+        None by default, to be populated by I/O helpers (e.g. from_asc). (default: None)
+    validations: polars.DataFrame | None
+        The validations from the data: timestamp, num_points, tracked eye, accuracy_avg,
+        accuracy_max. None by default, to be populated by I/O helpers (e.g. from_asc).
+        (default: None)
     time_column: str | None
         The name of the timestamp column in the input data frame. This column will be renamed to
         ``time``. (default: None)
@@ -121,7 +137,7 @@ class Gaze:
         A dataframe of events in the gaze signal.
     experiment : Experiment | None
         The experiment definition.
-    metadata: dict[str, Any]
+    metadata: dict[str, Any] | None
         Dictionary containing additional metadata.
     messages: polars.DataFrame | None
         DataFrame containing messages from the experiment session.
@@ -214,9 +230,9 @@ class Gaze:
     >>> experiment = Experiment(1024, 768, 38, 30, 60, 'center', sampling_rate=100)
     >>> gaze = Gaze(samples=df_no_time, experiment=experiment, pixel_columns=['x', 'y'])
     >>> gaze
-    Experiment(screen=Screen(width_px=1024, height_px=768, width_cm=38, height_cm=30,
-     distance_cm=60, origin='center'), eyetracker=EyeTracker(sampling_rate=100, left=None,
-      right=None, model=None, version=None, vendor=None, mount=None))
+    Experiment(screen=Screen(resolution=(1024, 768), size=(38, 30), distance_cm=60,
+      origin='center'), eyetracker=EyeTracker(sampling_rate=100, left=None, right=None, model=None,
+      version=None, vendor=None, mount=None))
     shape: (3, 2)
     ┌──────┬────────────┐
     │ time ┆ pixel      │
@@ -235,7 +251,7 @@ class Gaze:
 
     experiment: Experiment | None
 
-    metadata: dict[str, Any]
+    metadata: dict[str, Any] | None
 
     messages: polars.DataFrame | None
 
@@ -259,6 +275,8 @@ class Gaze:
             metadata: dict[str, Any] | None = None,
             messages: polars.DataFrame | None = None,
             trial_columns: str | list[str] | None = None,
+            calibrations: polars.DataFrame | None = None,
+            validations: polars.DataFrame | None = None,
             time_column: str | None = None,
             time_unit: str | None = None,
             pixel_columns: list[str] | None = None,
@@ -326,8 +344,15 @@ class Gaze:
         _check_messages(messages)
         self.messages = messages
 
-        self.calibrations = None
-        self.validations = None
+        if calibrations is not None:
+            self.calibrations = calibrations
+        else:
+            self.calibrations = None
+
+        if validations is not None:
+            self.validations = validations
+        else:
+            self.validations = None
 
         # Keep remaining parsed metadata privately if an I/O helper provides it.
         self._metadata = None
@@ -515,18 +540,32 @@ class Gaze:
         gazes: dict[tuple[Any, ...], Gaze] = {}
 
         for key in keys:
-            metadata_split = deepcopy(self.metadata)
+            metadata_split: dict[str, Any] = (
+                deepcopy(self.metadata) if self.metadata else {}
+            )
             if extend_metadata:
                 for by_id, column_name in enumerate(by):
                     metadata_split[column_name] = key[by_id]
+
+            messages = self.messages.clone() if self.messages is not None else None
+            calibrations = (
+                self.calibrations.clone() if self.calibrations is not None else None
+            )
+            validations = (
+                self.validations.clone() if self.validations is not None else None
+            )
 
             gaze_split = Gaze(
                 samples=grouped_samples.get(key, polars.DataFrame(schema=self.samples.schema)),
                 events=grouped_events.get(key, None),
                 experiment=self.experiment,
                 trial_columns=self.trial_columns,
-                metadata=metadata_split,
+                metadata=metadata_split if (self.metadata is not None or extend_metadata) else None,
+                messages=messages,
+                calibrations=calibrations,
+                validations=validations,
             )
+            gaze_split.n_components = self.n_components
             gazes[key] = gaze_split
 
         if as_dict:
@@ -1075,7 +1114,7 @@ class Gaze:
                 f"No events with name '{name}' found in events.",
             )
 
-        mask_expr = events2segmentation(
+        mask_expr = transforms.events2segmentation(
             events_frame,
             name=name,
             time_column='time',
@@ -1494,7 +1533,7 @@ class Gaze:
                 },
             )
 
-        return events2timeratio(
+        return transforms.events2timeratio(
             events=events_df,
             samples=self.samples,
             name=name,
@@ -1744,7 +1783,7 @@ class Gaze:
             if mode == 'direct':
                 x_eye, y_eye = payload
                 aois = [
-                    aoi_dataframe.get_aoi(row=row, x_eye=x_eye, y_eye=y_eye)
+                    aoi_dataframe.get_aoi(row=row, x_eye=x_eye, y_eye=y_eye, max_matches=1)
                     for row in tqdm(self.samples.iter_rows(named=True))
                 ]
             elif mode == 'average_lr':
@@ -1763,7 +1802,9 @@ class Gaze:
                     tmp = dict(row)
                     tmp['__x'] = x_val
                     tmp['__y'] = y_val
-                    aois.append(aoi_dataframe.get_aoi(row=tmp, x_eye='__x', y_eye='__y'))
+                    aois.append(
+                        aoi_dataframe.get_aoi(row=tmp, x_eye='__x', y_eye='__y', max_matches=1),
+                    )
             else:
                 # This branch is unreachable with the current selector:
                 # the flat-components selector only yields 'direct', 'average_lr' or None
@@ -1867,10 +1908,12 @@ class Gaze:
                 tmp_row = dict(row)
                 tmp_row['__x'] = x
                 tmp_row['__y'] = y
-                aois.append(aoi_dataframe.get_aoi(row=tmp_row, x_eye='__x', y_eye='__y'))
+                aois.append(
+                    aoi_dataframe.get_aoi(row=tmp_row, x_eye='__x', y_eye='__y', max_matches=1),
+                )
 
         aoi_df = polars.concat(aois)
-        self.samples = polars.concat([self.samples, aoi_df], how='horizontal')
+        self.samples = polars.concat([self.samples, aoi_df], how='horizontal_extend')
 
     def nest(
             self,
@@ -1945,13 +1988,219 @@ class Gaze:
         Gaze
             A copy of the Gaze.
         """
+        messages = self.messages.clone() if self.messages is not None else None
+        calibrations = self.calibrations.clone() if self.calibrations is not None else None
+        validations = self.validations.clone() if self.validations is not None else None
+
         gaze = Gaze(
             samples=self.samples.clone(),
             experiment=deepcopy(self.experiment),
             events=self.events.clone(),
+            metadata=deepcopy(self.metadata),
+            messages=messages,
+            trial_columns=deepcopy(self.trial_columns),
+            calibrations=calibrations,
+            validations=validations,
         )
         gaze.n_components = self.n_components
         return gaze
+
+    def validate(
+            self,
+            *,
+            trial_columns_exist: bool = True,
+            trial_columns_dtype: bool = True,
+            time_column_exists: bool = True,
+            gaze_components_defined: bool = True,
+            time_monotone: bool = True,
+            max_gap: bool = True,
+            max_gap_factor: float = 5.0,
+            sampling_rate_consistency: bool = True,
+            max_deviation: float = 0.05,
+            gaze_range: bool = True,
+            min_fraction: float = 0.95,
+            source_path: str = '',
+    ) -> list[CheckResult]:
+        """Run data quality validation checks on this gaze object.
+
+        Each check can be individually enabled or disabled via its boolean argument.
+        By default all eight checks are run.
+
+        Parameters
+        ----------
+        trial_columns_exist : bool
+            Check that every column listed in ``trial_columns`` is present in the
+            sample schema. (default: True)
+        trial_columns_dtype : bool
+            Check that trial-identifier columns have integer or string dtype, not
+            float. (default: True)
+        time_column_exists : bool
+            Check that a numeric ``'time'`` column is present. (default: True)
+        gaze_components_defined : bool
+            Check that at least one coordinate column (pixel, position, velocity or
+            acceleration) is present. (default: True)
+        time_monotone : bool
+            Check that timestamps are strictly monotone increasing within each trial.
+            (default: True)
+        max_gap : bool
+            Check that no inter-sample gap exceeds ``max_gap_factor`` times the
+            expected inter-sample interval. (default: True)
+        max_gap_factor : float
+            Maximum allowed inter-sample gap as a multiple of the expected ISI.
+            Only used when *max_gap* is ``True``. (default: 5.0)
+        sampling_rate_consistency : bool
+            Check that the empirical median ISI matches the declared sampling rate
+            within ``max_deviation``. (default: True)
+        max_deviation : float
+            Maximum allowed relative deviation between empirical and declared
+            sampling rate. Only used when *sampling_rate_consistency* is ``True``.
+            (default: 0.05, i.e. 5%)
+        gaze_range : bool
+            Check that at least ``min_fraction`` of gaze samples fall within screen
+            bounds. (default: True)
+        min_fraction : float
+            Minimum fraction of non-null samples that must lie within screen bounds.
+            Only used when *gaze_range* is ``True``. (default: 0.95, i.e. 95%)
+        source_path : str
+            Identifier for this gaze object (e.g. a file path). Included in the
+            ``sources`` field of any failing :py:class:`CheckResult`.
+            (default: ``''``)
+
+        Returns
+        -------
+        list[CheckResult]
+            One :py:class:`~pymovements.CheckResult` per enabled
+            check, in the order listed above.
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> from pymovements import Gaze
+        >>> samples = pl.DataFrame(
+        ...     {'time': [0, 1, 2], 'x': [0.0, 1.0, 2.0], 'y': [0.0, 1.0, 2.0]}
+        ... )
+        >>> gaze = Gaze(samples=samples, pixel_columns=['x', 'y'])
+        >>> results = gaze.validate()
+        >>> all(r.severity in {'pass', 'warning', 'fail', 'error'} for r in results)
+        True
+        """
+        results: list[CheckResult] = []
+        if trial_columns_exist:
+            results.append(check_trial_columns_exist(self, source_path))
+        if trial_columns_dtype:
+            results.append(check_trial_columns_dtype(self, source_path))
+        if time_column_exists:
+            results.append(check_time_column_exists(self, source_path))
+        if gaze_components_defined:
+            results.append(check_gaze_components_defined(self, source_path))
+        if time_monotone:
+            results.append(check_time_monotone(self, source_path))
+        if max_gap:
+            results.append(check_max_gap(self, source_path, max_gap_factor=max_gap_factor))
+        if sampling_rate_consistency:
+            results.append(
+                check_sampling_rate_consistency(self, source_path, max_deviation=max_deviation),
+            )
+        if gaze_range:
+            results.append(check_gaze_range(self, source_path, min_fraction=min_fraction))
+        return results
+
+    def report_data_quality(
+            self,
+            *,
+            checks: list[str] | None = None,
+            measures: list[str] | None = None,
+            levels: list[str] | None = None,
+            raise_on_error: bool = False,
+            output_path: Path | str | None = None,
+            source_path: str = '',
+            max_gap_factor: float = 5.0,
+            max_deviation: float = 0.05,
+            min_fraction: float = 0.95,
+    ) -> DataQualityReport:
+        """Generate a data quality report for this gaze object.
+
+        Runs validation checks via :py:meth:`validate` and computes quality
+        measures (data loss, fixation precision) for this single gaze file.
+        The result is a :py:class:`~pymovements.DataQualityReport`
+        that can optionally be saved as BIDS-conformant derivative files.
+
+        Parameters
+        ----------
+        checks : list[str] | None
+            Check identifiers to run. ``None`` runs all eight checks.
+            Valid values: ``'trial_columns_exist'``, ``'trial_columns_dtype'``,
+            ``'time_column_exists'``, ``'gaze_components_defined'``,
+            ``'time_monotone'``, ``'max_gap'``, ``'sampling_rate_consistency'``,
+            ``'gaze_range'``.
+        measures : list[str] | None
+            Measures to compute. ``None`` computes all four.
+            Valid values: ``'data_loss'``, ``'std_rms'``, ``'rms_s2s'``,
+            ``'bcea'``.
+        levels : list[str] | None
+            Aggregation levels. ``None`` defaults to ``['dataset', 'trial']``
+            (meaningful for a single file; pass ``'subject'`` or ``'session'``
+            explicitly if needed).
+        raise_on_error : bool
+            If ``True``, raise :py:exc:`~pymovements.ValidationError` on the
+            first ``'fail'`` or ``'error'``-severity check result. (default: ``False``)
+        output_path : Path | str | None
+            If given, write BIDS-conformant derivative files here via
+            :py:meth:`~DataQualityReport.save_bids_report`.
+            (default: ``None``)
+        source_path : str
+            Identifier for this gaze object (e.g. a file path). Used as
+            ``affected_files`` in failing :py:class:`CheckResult` objects.
+            (default: ``''``)
+        max_gap_factor : float
+            Maximum allowed inter-sample gap as a multiple of the expected ISI.
+            Passed to the ``'max_gap'`` check. (default: 5.0)
+        max_deviation : float
+            Maximum allowed relative deviation between empirical and declared
+            sampling rate. Passed to the ``'sampling_rate_consistency'`` check.
+            (default: 0.05, i.e. 5%)
+        min_fraction : float
+            Minimum fraction of non-null samples that must lie within screen
+            bounds. Passed to the ``'gaze_range'`` check. (default: 0.95)
+
+        Returns
+        -------
+        DataQualityReport
+            Aggregated check results, quality measures, pass/fail status, and
+            any Python warnings captured during the run.
+
+        Raises
+        ------
+        pymovements.ValidationError
+            If *raise_on_error* is ``True`` and any check produces an error
+            result.
+        ValueError
+            If any name in *checks* is not a valid check identifier.
+
+        Examples
+        --------
+        >>> import polars as pl
+        >>> from pymovements import Gaze
+        >>> samples = pl.DataFrame(
+        ...     {'time': [0, 1, 2], 'x': [0.0, 1.0, 2.0], 'y': [0.0, 1.0, 2.0]}
+        ... )
+        >>> gaze = Gaze(samples=samples, pixel_columns=['x', 'y'])
+        >>> report = gaze.report_data_quality(checks=['time_column_exists'])
+        >>> report.passed
+        True
+        """
+        return run_report(
+            gaze=self,
+            checks=checks,
+            measures=measures,
+            levels=levels,
+            raise_on_error=raise_on_error,
+            output_path=output_path,
+            source_path=source_path,
+            max_gap_factor=max_gap_factor,
+            max_deviation=max_deviation,
+            min_fraction=min_fraction,
+        )
 
     def _check_experiment(self) -> None:
         """Check if the experiment attribute has been set.
@@ -2175,12 +2424,7 @@ class Gaze:
                     'eye_components must not be None if passing position to event detection',
                 )
 
-            kwargs['positions'] = np.vstack(
-                [
-                    samples.get_column('position').list.get(eye_component)
-                    for eye_component in eye_components
-                ],
-            ).transpose()
+            kwargs['positions'] = samples.get_column('position').list.gather(eye_components)
 
         if 'velocities' in method_args:
             if 'velocity' not in samples.columns:
@@ -2194,12 +2438,7 @@ class Gaze:
                     'eye_components must not be None if passing velocity to event detection',
                 )
 
-            kwargs['velocities'] = np.vstack(
-                [
-                    samples.get_column('velocity').list.get(eye_component)
-                    for eye_component in eye_components
-                ],
-            ).transpose()
+            kwargs['velocities'] = samples.get_column('velocity').list.gather(eye_components)
 
         if 'pixels' in method_args and 'pixels' not in kwargs:
             if 'pixel' not in samples.columns:
@@ -2213,12 +2452,7 @@ class Gaze:
                     'eye_components must not be None if passing pixel to event detection',
                 )
 
-            kwargs['pixels'] = np.vstack(
-                [
-                    samples.get_column('pixel').list.get(eye_component)
-                    for eye_component in eye_components
-                ],
-            ).transpose()
+            kwargs['pixels'] = samples.get_column('pixel').list.gather(eye_components)
 
         if 'pupil' in method_args and 'pupil' not in kwargs:
             if 'pupil' not in samples.columns:
@@ -2230,9 +2464,9 @@ class Gaze:
             if isinstance(pupil_series.dtype, polars.List):
                 # Binocular: [left, right] — pick eye based on eye_components
                 eye_idx = 1 if eye_components and eye_components[0] in {2, 3} else 0
-                kwargs['pupil'] = pupil_series.list.get(eye_idx).to_numpy()
+                kwargs['pupil'] = pupil_series.list.get(eye_idx)
             else:
-                kwargs['pupil'] = pupil_series.to_numpy()
+                kwargs['pupil'] = pupil_series
 
         if method.__name__ == 'out_of_screen' and self.experiment is not None:
             if 'x_min' not in kwargs:
@@ -2248,7 +2482,7 @@ class Gaze:
             kwargs['events'] = events
 
         if 'timesteps' in method_args and 'time' in samples.columns:
-            kwargs['timesteps'] = samples.get_column('time').to_numpy()
+            kwargs['timesteps'] = samples.get_column('time')
 
         return kwargs
 
@@ -2444,15 +2678,23 @@ class Gaze:
             save_events: bool | None = None,
             save_samples: bool | None = None,
             save_experiment: bool | None = None,
+            save_metadata: bool | None = None,
+            save_messages: bool | None = None,
+            save_calibrations: bool | None = None,
+            save_validations: bool | None = None,
             verbose: int = 1,
             extension: str = 'feather',
     ) -> Gaze:
         """Save data from the Gaze object in the provided directory.
 
-        Depending on parameters, it may save three files:
+        Depending on parameters, it may save multiple files:
         * preprocessed gaze in samples (samples)
         * calculated gaze events (events)
-        * metadatata experiment in YAML file (experiment).
+        * metadata experiment in YAML file (experiment)
+        * additional metadata in YAML file (metadata)
+        * messages from experiment session (messages)
+        * calibrations data (calibrations)
+        * validations data (validations)
 
         Data will be saved as feather or csv files.
 
@@ -2473,11 +2715,38 @@ class Gaze:
             Save samples in sample.{extension} file
         save_experiment: bool | None
             Save experiment metadata in experiment.yaml file
+        save_metadata: bool | None
+            Save metadata dictionary in metadata.yaml file
+        save_messages: bool | None
+            Save messages in messages.{extension} file
+        save_calibrations: bool | None
+            Save calibrations in calibrations.{extension} file
+        save_validations: bool | None
+            Save validations in validations.{extension} file
         verbose: int
             Verbosity level (0: no print output, 1: show progress bar, 2: print saved filepaths)
             (default: 1)
         extension: str
             Extension specifies the fileformat to store the data. (default: 'feather')
+
+        Examples
+        --------
+        Save all available data fields to a directory:
+
+        >>> import polars as pl
+        >>> from pymovements import Gaze
+        >>> gaze = Gaze(
+        ...     samples=pl.DataFrame({'x': [1, 2], 'y': [3, 4]}),
+        ...     pixel_columns=['x', 'y'],
+        ...     metadata={'subject_id': 42},
+        ...     messages=pl.DataFrame({'time': [0], 'content': ['start']}),
+        ...     calibrations=pl.DataFrame({'timestamp': [0], 'num_points': [9]}),
+        ...     validations=pl.DataFrame({'timestamp': [0], 'accuracy_avg': [0.5]}),
+        ... )
+        >>> _ = gaze.save('./output', save_metadata=True, save_messages=True,
+        ...           save_calibrations=True, save_validations=True, verbose=0)
+        >>> # Creates: samples.feather, events.feather, metadata.yaml,
+        >>> #          messages.feather, calibrations.feather, validations.feather
 
         Raises
         ------
@@ -2505,6 +2774,48 @@ class Gaze:
                 self.experiment.to_yaml(Path(f'{dirpath}/experiment.yaml'))
             elif save_experiment is not None:
                 raise ValueError('no experiment data in the Gaze object')
+
+        if save_metadata is None or save_metadata:
+            if verbose >= 2:
+                print('Saving metadata file to', dirpath)
+            if self.metadata:
+                with open(Path(f"{dirpath}/metadata.yaml"), 'w', encoding='utf-8') as f:
+                    yaml.safe_dump(self.metadata, f, default_flow_style=False)
+            elif save_metadata is not None:
+                raise ValueError('no metadata in the Gaze object')
+
+        if save_messages is None or save_messages:
+            if verbose >= 2:
+                print('Saving messages file to', dirpath)
+            if self.messages is not None:
+                self.save_messages(
+                    Path(f"{dirpath}/messages.{extension}"), verbose=verbose,
+                )
+            elif save_messages is not None:
+                raise ValueError('no messages in the Gaze object')
+
+        if save_calibrations is None or save_calibrations:
+            if verbose >= 2:
+                print('Saving calibrations file to', dirpath)
+            if self.calibrations is not None:
+                self.save_calibrations(
+                    Path(f'{dirpath}/calibrations.{extension}'),
+                    verbose=verbose,
+                )
+            elif save_calibrations is not None:
+                raise ValueError('no calibrations in the Gaze object')
+
+        if save_validations is None or save_validations:
+            if verbose >= 2:
+                print('Saving validations file to', dirpath)
+            if self.validations is not None:
+                self.save_validations(
+                    Path(f'{dirpath}/validations.{extension}'),
+                    verbose=verbose,
+                )
+            elif save_validations is not None:
+                raise ValueError('no validations in the Gaze object')
+
         return self
 
     def save_events(
@@ -2591,6 +2902,132 @@ class Gaze:
             raise ValueError(
                 f'unsupported file format "{extension}".'
                 f'Supported formats are: {valid_extensions}',
+            )
+
+    def save_messages(
+        self,
+        path: Path,
+        *,
+        verbose: int = 1,
+    ) -> None:
+        """Save messages to file.
+
+        Parameters
+        ----------
+        path: Path
+            File to save data.
+        verbose: int
+            Verbosity level (0: no print output, 1: show progress bar, 2: print saved filepaths)
+            (default: 1)
+
+        Raises
+        ------
+        ValueError
+            If file extension in path is not in list of valid extensions.
+        ValueError
+            If messages is None.
+        """
+        if self.messages is None:
+            raise ValueError('No messages in the Gaze object')
+
+        extension = path.suffix[1:]
+
+        if verbose >= 2:
+            print('Saving messages to', path)
+
+        if extension == 'feather':
+            self.messages.write_ipc(path)
+        elif extension == 'csv':
+            self.messages.write_csv(path)
+        else:
+            valid_extensions = ['csv', 'feather']
+            raise ValueError(
+                f'unsupported file format "{extension}".'
+                f"Supported formats are: {valid_extensions}",
+            )
+
+    def save_calibrations(
+        self,
+        path: Path,
+        *,
+        verbose: int = 1,
+    ) -> None:
+        """Save calibrations to file.
+
+        Parameters
+        ----------
+        path: Path
+            File to save data.
+        verbose: int
+            Verbosity level (0: no print output, 1: show progress bar, 2: print saved filepaths)
+            (default: 1)
+
+        Raises
+        ------
+        ValueError
+            If file extension in path is not in list of valid extensions.
+        ValueError
+            If calibrations is None.
+        """
+        if self.calibrations is None:
+            raise ValueError('No calibrations in the Gaze object')
+
+        extension = path.suffix[1:]
+
+        if verbose >= 2:
+            print('Saving calibrations to', path)
+
+        if extension == 'feather':
+            self.calibrations.write_ipc(path)
+        elif extension == 'csv':
+            self.calibrations.write_csv(path)
+        else:
+            valid_extensions = ['csv', 'feather']
+            raise ValueError(
+                f'unsupported file format "{extension}".'
+                f"Supported formats are: {valid_extensions}",
+            )
+
+    def save_validations(
+        self,
+        path: Path,
+        *,
+        verbose: int = 1,
+    ) -> None:
+        """Save validations to file.
+
+        Parameters
+        ----------
+        path: Path
+            File to save data.
+        verbose: int
+            Verbosity level (0: no print output, 1: show progress bar, 2: print saved filepaths)
+            (default: 1)
+
+        Raises
+        ------
+        ValueError
+            If file extension in path is not in list of valid extensions.
+        ValueError
+            If validations is None.
+        """
+        if self.validations is None:
+            raise ValueError('No validations in the Gaze object')
+
+        extension = path.suffix[1:]
+
+        if verbose >= 2:
+            print('Saving validations to', path)
+
+        if extension == 'feather':
+            self.validations.write_ipc(path)
+        elif extension == 'csv':
+            self.validations.write_csv(path)
+        else:
+            valid_extensions = ['csv', 'feather']
+            raise ValueError(
+                f'unsupported file format "{extension}".'
+                f"Supported formats are: {valid_extensions}",
             )
 
 

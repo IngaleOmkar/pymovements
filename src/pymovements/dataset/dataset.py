@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Callable
 from collections.abc import Sequence
 from copy import deepcopy
@@ -39,9 +40,14 @@ from pymovements.dataset.dataset_definition import DatasetDefinition
 from pymovements.dataset.dataset_files import DatasetFile
 from pymovements.dataset.dataset_library import DatasetLibrary
 from pymovements.dataset.dataset_paths import DatasetPaths
+from pymovements.dataset.participants import Participants
 from pymovements.events import Events
 from pymovements.events.precomputed import PrecomputedEventDataFrame
 from pymovements.gaze import Gaze
+from pymovements.gaze.quality import compute_measures
+from pymovements.gaze.quality import DataQualityReport
+from pymovements.gaze.quality import ValidationError
+from pymovements.gaze.validation import _ALL_CHECKS
 from pymovements.measure.reading import ReadingMeasures
 from pymovements.stimulus.image import ImageStimulus
 from pymovements.stimulus.text import TextStimulus
@@ -58,6 +64,11 @@ class Dataset:
 
     Initialize the dataset object.
 
+    Attributes
+    ----------
+    participants: Participants
+        Participant data.
+
     Parameters
     ----------
     definition: str | Path | DatasetDefinition | type[DatasetDefinition]
@@ -67,6 +78,8 @@ class Dataset:
         :py:class:`~pymovements.dataset.DatasetPaths` instance.
     """
 
+    participants: Participants
+
     def __init__(
             self,
             definition: str | Path | DatasetDefinition | type[DatasetDefinition],
@@ -74,6 +87,7 @@ class Dataset:
     ):
         self.fileinfo: pl.DataFrame = pl.DataFrame()
         self._files: list[DatasetFile] = []
+        self.participants = Participants()
         self.gaze: list[Gaze] = []
         self.precomputed_events: list[PrecomputedEventDataFrame] = []
         self.precomputed_reading_measures: list[ReadingMeasures] = []
@@ -105,6 +119,7 @@ class Dataset:
     def load(
             self,
             *,
+            participants: bool | None = None,
             events: bool | None = None,
             preprocessed: bool = False,
             stimuli: bool | None = None,
@@ -120,6 +135,10 @@ class Dataset:
 
         Parameters
         ----------
+        participants: bool | None
+            If ``True``, load participants data. If ``None``, load participants data only if
+            available.
+            (default: None)
         events: bool | None
             If ``True``, load previously saved event data. (default: None)
         preprocessed: bool
@@ -127,7 +146,7 @@ class Dataset:
             (default: False)
         stimuli: bool | None
             If ``True``, load stimulus data. If ``None``, load stimulus data only if available.
-            (default: True)
+            (default: None)
         subset:  dict[str, float | int | str | list[float | int | str]] | None
             If specified, load only a subset of the dataset. All keys in the dictionary must be
             present in the fileinfo dataframe inferred by `scan()`. Values can be either
@@ -158,6 +177,15 @@ class Dataset:
             files=self._files,
             subset=subset,
         )
+
+        # Load participants data if desired and if present.
+        if participants is not False:
+            participant_files = any(
+                file.definition is not None and file.definition.content == 'participants'
+                for file in self._files
+            )
+            if participant_files:
+                self.load_participants()
 
         if self.definition.resources.has_content('gaze'):
             self.load_gaze_files(
@@ -243,8 +271,22 @@ class Dataset:
         for gaze, ev in zip(self.gaze, data):
             gaze.events = ev
 
-    def scan(self) -> Dataset:
+    def scan(
+            self,
+            *,
+            participant_key: str = 'participant_id',
+    ) -> Dataset:
         """Infer information from filepaths and filenames.
+
+        Sets :py:attr:`~pymovements.Dataset.fileinfo` and
+        :py:attr:`~pymovements.Dataset.participants`.
+
+        Parameters
+        ----------
+        participant_key: str
+            The participant key used for identifying a participant. See
+            :py:meth:`~pymovements.Dataset.scan_participants` for more details.
+            (default: `'participant_id'`)
 
         Returns
         -------
@@ -261,7 +303,78 @@ class Dataset:
         self.fileinfo, self._files = dataset_files.scan_dataset(
             definition=self.definition, paths=self.paths,
         )
+        self.scan_participants(participant_key=participant_key)
         return self
+
+    def scan_participants(
+            self,
+            *,
+            participant_key: str = 'participant_id',
+    ) -> None:
+        """Scan files for participant metadata.
+
+        Currently only scans file metadata for participant id.
+
+        Parameters
+        ----------
+        participant_key: str
+            The participant key used for identifying a participant. This corresponds to the group
+            name specified in :py:attr:`~pymovements.ResourceDefinition.filename_pattern`. Usually
+            this is `'participant_id'` or `'subject_id'`. Values will be used to fill the
+            `participant_id` column of :py:attr:`~pymovements.Dataset.participants`.
+            (default: `'participant_id'`)
+        """
+        participant_ids = set()
+        for file in self._files:
+            if participant_key in file.metadata:
+                participant_ids.add(file.metadata[participant_key])
+
+        participant_data = pl.from_dict(
+            {'participant_id': list(participant_ids)},
+        ).sort('participant_id')
+
+        if len(participant_data):
+            self.participants.update(participant_data)
+
+    def load_participants(
+            self,
+            *,
+            replace: bool = False,
+    ) -> None:
+        """Load participants file from resources.
+
+        Parameters
+        ----------
+        replace: bool
+            If `True` this will replace :py:attr:`~pymovements.Dataset.participants` with the loaded
+            data. If `False` this will update the existing data in
+            :py:attr:`~pymovements.Dataset.participants` with the loaded data.
+        """
+        participants_files = [
+            file
+            for file in self._files
+            if file.definition and file.definition.content == 'participants'
+        ]
+
+        if len(participants_files) > 1:
+            raise AttributeError('there may be only a single participants resource per dataset')
+        if not participants_files:
+            raise AttributeError('no participant file defined in dataset resources')
+        participants_file = participants_files[0]
+        participants_definition = participants_file.definition
+
+        loaded_participants = Participants.load(
+            path=participants_file.path,
+            **participants_definition.load_kwargs,
+        )
+
+        if replace:
+            self.participants = loaded_participants
+        else:
+            self.participants.update(
+                data=loaded_participants.data,
+                metadata=loaded_participants.metadata,
+            )
 
     def load_gaze_files(
             self,
@@ -1131,6 +1244,157 @@ class Dataset:
             extension=extension,
         )
         return self
+
+    def report_data_quality(
+            self,
+            *,
+            output_path: Path | str | None = None,
+            checks: list[str] | None = None,
+            measures: list[str] | None = None,
+            levels: list[str] | None = None,
+            raise_on_error: bool = False,
+            max_gap_factor: float = 5.0,
+            max_deviation: float = 0.05,
+            min_fraction: float = 0.95,
+    ) -> DataQualityReport:
+        """Run sanity checks and compute data quality measures for all loaded gaze data.
+
+        Three processing stages are executed in sequence:
+
+        1. **Validation checks** — eight stimulus-agnostic checks (see *checks* parameter)
+           that verify column presence, dtypes, temporal continuity, and gaze range.
+        2. **Quality measures** — ``data_loss``, ``std_rms``, ``rms_s2s``, and ``bcea``
+           aggregated at dataset, subject, session, and trial level.
+        3. **BIDS output** (optional) — writes derivative TSV/JSON files and a
+           ``warnings.log`` under ``output_path / 'derivatives' / 'pymovements' /``.
+
+        Parameters
+        ----------
+        output_path : Path | str | None
+            If provided, write BIDS-conformant derivative report files here.
+            (default: None)
+        checks : list[str] | None
+            Check identifiers to run. ``None`` runs all eight checks. Valid identifiers:
+            ``'trial_columns_exist'``, ``'trial_columns_dtype'``,
+            ``'time_column_exists'``, ``'gaze_components_defined'``,
+            ``'time_monotone'``, ``'max_gap'``, ``'sampling_rate_consistency'``,
+            ``'gaze_range'``.
+            (default: None)
+        measures : list[str] | None
+            Measure identifiers to compute. ``None`` computes all four. Valid:
+            ``'data_loss'``, ``'std_rms'``, ``'rms_s2s'``, ``'bcea'``.
+            (default: None)
+        levels : list[str] | None
+            Aggregation levels for measures. ``None`` uses all four. Valid:
+            ``'dataset'``, ``'subject'``, ``'session'``, ``'trial'``.
+            (default: None)
+        raise_on_error : bool
+            If ``True``, raise :py:exc:`~pymovements.ValidationError`
+            on the first check result with severity ``'fail'`` or ``'error'``. (default: False)
+        max_gap_factor : float
+            Maximum allowed inter-sample gap as a multiple of the expected ISI.
+            Passed to the ``'max_gap'`` check. (default: 5.0)
+        max_deviation : float
+            Maximum allowed relative deviation between empirical and declared
+            sampling rate. Passed to the ``'sampling_rate_consistency'`` check.
+            (default: 0.05, i.e. 5%)
+        min_fraction : float
+            Minimum fraction of non-null samples that must lie within screen bounds.
+            Passed to the ``'gaze_range'`` check. (default: 0.95, i.e. 95%)
+
+        Returns
+        -------
+        DataQualityReport
+            An object containing all :py:class:`~pymovements.CheckResult` objects
+            and per-level measure :py:class:`polars.DataFrame` tables.
+
+        Raises
+        ------
+        ValidationError
+            If *raise_on_error* is ``True`` and any check produces an error result.
+        ValueError
+            If any name in *checks* is not a valid check identifier.
+
+        Examples
+        --------
+        >>> import pymovements as pm
+        >>> # dataset = pm.Dataset('ExampleDataset', path='data/')
+        >>> # dataset.load()
+        >>> # report = dataset.report_data_quality()
+        >>> # print(report.summary())
+        """
+        checks_to_run = set(checks) if checks is not None else set(_ALL_CHECKS.keys())
+        levels_to_run = (
+            levels if levels is not None else ['dataset', 'subject', 'session', 'trial']
+        )
+
+        if checks is not None:
+            unknown = checks_to_run - set(_ALL_CHECKS.keys())
+            if unknown:
+                raise ValueError(
+                    f'Unknown check identifier(s) {sorted(unknown)!r}. '
+                    f'Valid identifiers: {list(_ALL_CHECKS.keys())!r}',
+                )
+
+        # Use real file paths from fileinfo when available; otherwise leave blank.
+        if (
+            isinstance(self.fileinfo, dict)
+            and 'gaze' in self.fileinfo
+            and 'filepath' in self.fileinfo['gaze'].columns
+        ):
+            source_paths: list[str] = self.fileinfo['gaze']['filepath'].cast(pl.Utf8).to_list()
+        else:
+            source_paths = ['' for _ in self.gaze]
+
+        check_results: list = []
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+
+            for idx, gaze in enumerate(self.gaze):
+                src = source_paths[idx] if idx < len(source_paths) else ''
+                results = gaze.validate(
+                    trial_columns_exist='trial_columns_exist' in checks_to_run,
+                    trial_columns_dtype='trial_columns_dtype' in checks_to_run,
+                    time_column_exists='time_column_exists' in checks_to_run,
+                    gaze_components_defined='gaze_components_defined' in checks_to_run,
+                    time_monotone='time_monotone' in checks_to_run,
+                    max_gap='max_gap' in checks_to_run,
+                    max_gap_factor=max_gap_factor,
+                    sampling_rate_consistency='sampling_rate_consistency' in checks_to_run,
+                    max_deviation=max_deviation,
+                    gaze_range='gaze_range' in checks_to_run,
+                    min_fraction=min_fraction,
+                    source_path=src,
+                )
+                for result in results:
+                    check_results.append(result)
+                    if raise_on_error and result.severity in {'fail', 'error'}:
+                        raise ValidationError(
+                            check_id=result.code,
+                            message=str(result.message),
+                            affected_files=result.sources,
+                        )
+
+            measure_results = compute_measures(
+                gaze_list=self.gaze,
+                fileinfo=self.fileinfo,
+                levels=levels_to_run,
+                measures=measures,
+            )
+
+            captured_warnings = [str(w.message) for w in caught]
+
+        report = DataQualityReport(
+            check_results=check_results,
+            measures=measure_results,
+            warning_log=captured_warnings,
+        )
+
+        if output_path is not None:
+            report.save_bids_report(Path(output_path))
+
+        return report
 
     def download(
             self,

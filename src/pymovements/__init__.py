@@ -18,7 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """Provides top-level access to submodules."""
-from pymovements import datasets
 from pymovements import events
 from pymovements import exceptions
 from pymovements import gaze
@@ -26,10 +25,12 @@ from pymovements import measure
 from pymovements import plotting
 from pymovements import stimulus
 from pymovements import synthetic
+from pymovements import transforms
 from pymovements import warnings
 from pymovements._version import __version__
 from pymovements.dataset import Dataset
 from pymovements.dataset import DatasetDefinition
+from pymovements.dataset import DatasetFile
 from pymovements.dataset import DatasetLibrary
 from pymovements.dataset import DatasetPaths
 from pymovements.dataset import Participants
@@ -46,6 +47,9 @@ from pymovements.gaze import EyeTracker
 from pymovements.gaze import Gaze
 from pymovements.gaze import GazeDataFrame
 from pymovements.gaze import Screen
+from pymovements.gaze.quality import CheckResult
+from pymovements.gaze.quality import DataQualityReport
+from pymovements.gaze.quality import ValidationError
 from pymovements.measure import EVENT_MEASURES
 from pymovements.measure import EventProcessor
 from pymovements.measure import EventSamplesProcessor
@@ -58,11 +62,15 @@ from pymovements.warnings import ExperimentalWarning
 
 
 __all__ = [
+    'CheckResult',
     'Dataset',
     'DatasetDefinition',
+    'DataQualityReport',
+    'DatasetFile',
     'DatasetLibrary',
     'DatasetPaths',
     'datasets',
+    'ValidationError',
     'Participants',
     'register_dataset',
     'ResourceDefinition',
@@ -94,6 +102,7 @@ __all__ = [
     'plotting',
     'stimulus',
     'synthetic',
+    'transforms',
 
     'exceptions',
     'UnknownFileType',
